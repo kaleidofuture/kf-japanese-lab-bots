@@ -48,12 +48,15 @@ function Restart-Task {
     $endOut = & schtasks /End /TN $TaskName 2>&1 | Out-String
     Start-Sleep -Seconds 2
 
+    # Use CIM/WMI here, not Get-Process. The auto-pull task runs at Limited
+    # integrity while KF Tenshi runs at Highest, and Get-Process cannot read
+    # `.Path` across that boundary — Win32_Process.ExecutablePath can.
     $killed = 0
     if ($ProcessFilter) {
-        $stale = Get-Process pythonw, python -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -like $ProcessFilter }
+        $stale = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -like $ProcessFilter }
         foreach ($p in $stale) {
-            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $killed++ } catch {}
+            try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $killed++ } catch {}
         }
         if ($killed -gt 0) { Start-Sleep -Seconds 1 }
     }
