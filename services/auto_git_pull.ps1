@@ -1,0 +1,99 @@
+# Auto-deploy for KF Japanese Lab Bots.
+#
+# Pulls origin/main once per minute. When changes affect a bot folder,
+# restarts the corresponding Task Scheduler task. Modeled after the
+# KaleidoAIMusic auto_git_pull pattern.
+#
+# Manual actions never automated:
+#   - requirements.txt changes  → run pip install in the bot's .venv
+#   - services/* changes        → re-run install_auto_deploy.ps1 if needed
+#
+# Logging policy: silent on "Already up to date" to avoid filling the log
+# every minute. Writes only on actual pulls and errors.
+
+$ErrorActionPreference = "Continue"
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = Split-Path -Parent $ScriptDir
+$LogDir = Join-Path $RepoRoot "logs"
+$LogPath = Join-Path $LogDir "auto_git_pull.log"
+
+if (-not (Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+# Map: regex matching changed-file path -> Task Scheduler task name
+$BotTaskMap = @(
+    @{ Pattern = '^kf_tenshi/.*\.(py|bat|env\.example)$'; Task = 'KFTenshi' }
+    # Add future bots here, e.g.:
+    # @{ Pattern = '^kf_role_logger/.*\.(py|bat)$'; Task = 'KFRoleLogger' }
+)
+
+$WarnPatterns = @(
+    @{ Pattern = '^.*requirements\.txt$'; Note = 'manual: activate the affected venv and run pip install -r requirements.txt' }
+    @{ Pattern = '^services/.*';          Note = 'manual: re-run install_auto_deploy.ps1 if the schedule itself changed' }
+)
+
+function Restart-Task {
+    param([string]$TaskName)
+
+    $endOut = & schtasks /End /TN $TaskName 2>&1 | Out-String
+    Start-Sleep -Seconds 3
+    $runOut = & schtasks /Run /TN $TaskName 2>&1 | Out-String
+
+    Add-Content -Path $LogPath -Value "[$timestamp] restart $TaskName" -Encoding UTF8
+    if ($endOut.Trim()) { Add-Content -Path $LogPath -Value ("  end : " + $endOut.Trim()) -Encoding UTF8 }
+    if ($runOut.Trim()) { Add-Content -Path $LogPath -Value ("  run : " + $runOut.Trim()) -Encoding UTF8 }
+}
+
+try {
+    $headBefore = (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim()
+
+    $output = & git -C $RepoRoot pull --ff-only 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        Add-Content -Path $LogPath -Value "[$timestamp] FAIL exit=$exitCode" -Encoding UTF8
+        Add-Content -Path $LogPath -Value $output -Encoding UTF8
+        exit 0
+    }
+
+    if ($output -match "Already up to date") {
+        exit 0
+    }
+
+    Add-Content -Path $LogPath -Value "[$timestamp] PULL OK" -Encoding UTF8
+    Add-Content -Path $LogPath -Value $output.TrimEnd() -Encoding UTF8
+
+    $headAfter = (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim()
+    $changedFiles = & git -C $RepoRoot diff --name-only "$headBefore" "$headAfter" 2>$null
+
+    # Bot restarts (deduplicated — restart each task only once even if multiple files matched)
+    $restartedTasks = @{}
+    foreach ($entry in $BotTaskMap) {
+        $matched = @($changedFiles | Where-Object { $_ -match $entry.Pattern })
+        if ($matched.Count -gt 0 -and -not $restartedTasks.ContainsKey($entry.Task)) {
+            $sample = ($matched | Select-Object -First 5) -join ', '
+            if ($matched.Count -gt 5) { $sample += ", ... ($($matched.Count) files)" }
+            Add-Content -Path $LogPath -Value "[$timestamp] $($entry.Task) trigger: $sample" -Encoding UTF8
+            Restart-Task -TaskName $entry.Task
+            $restartedTasks[$entry.Task] = $true
+        }
+    }
+
+    # Manual-action warnings (never auto-applied)
+    foreach ($entry in $WarnPatterns) {
+        $matched = @($changedFiles | Where-Object { $_ -match $entry.Pattern })
+        if ($matched.Count -gt 0) {
+            Add-Content -Path $LogPath -Value "[$timestamp] WARN $($entry.Note): $($matched -join ', ')" -Encoding UTF8
+        }
+    }
+
+    Add-Content -Path $LogPath -Value "" -Encoding UTF8
+}
+catch {
+    Add-Content -Path $LogPath -Value "[$timestamp] EXCEPTION: $_" -Encoding UTF8
+    exit 0
+}

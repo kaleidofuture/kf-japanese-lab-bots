@@ -33,6 +33,23 @@ copy .env.example .env
 
 For persistent operation on Windows, register `run.bat` with Task Scheduler (`schtasks /Create /TN KFTenshi /TR <path>\run.bat /SC ONLOGON /RL HIGHEST`).
 
+## Auto-deploy (host machine, optional)
+
+The `services/` folder contains a 1-minute polling auto-deploy:
+
+- `services/run_hidden_pull.vbs` — wscript launcher (no console flicker)
+- `services/auto_git_pull.ps1` — `git pull --ff-only`, restart bots only when their files actually changed, warn on `requirements.txt` / `services/*` (manual action)
+- `services/install_auto_deploy.ps1` — registers the `KFLabBotsAutoPull` Task Scheduler task (run once per host)
+
+Install:
+
+```powershell
+cd <repo>\services
+powershell -ExecutionPolicy Bypass -File install_auto_deploy.ps1
+```
+
+After install, every `git push` to `origin/main` reaches the host within a minute. Logs go to `logs/auto_git_pull.log` (silent on no-op pulls).
+
 ## Architecture notes
 
 - **Wrapper log vs app log are separated** — `run.bat` redirects stdout/stderr to `wrapper.log`; the app itself writes structured logs to `kf_tenshi.log` via Python `logging.FileHandler`. They cannot share the same file due to Windows file locking.
