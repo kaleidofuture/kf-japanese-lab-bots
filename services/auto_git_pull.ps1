@@ -24,11 +24,14 @@ if (-not (Test-Path $LogDir)) {
 
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-# Map: regex matching changed-file path -> Task Scheduler task name
+# Map: regex of changed-file path -> { task name, process path filter }
+# ProcessFilter is used to force-kill lingering pythonw children that
+# `schtasks /End` does not stop (it terminates the task but leaves any
+# spawned process running).
 $BotTaskMap = @(
-    @{ Pattern = '^kf_tenshi/.*\.(py|bat|env\.example)$'; Task = 'KFTenshi' }
+    @{ Pattern = '^kf_tenshi/.*\.(py|bat|env\.example)$'; Task = 'KFTenshi'; ProcessFilter = '*kf-japanese-lab-bots*kf_tenshi*' }
     # Add future bots here, e.g.:
-    # @{ Pattern = '^kf_role_logger/.*\.(py|bat)$'; Task = 'KFRoleLogger' }
+    # @{ Pattern = '^kf_role_logger/.*\.(py|bat)$'; Task = 'KFRoleLogger'; ProcessFilter = '*kf-japanese-lab-bots*kf_role_logger*' }
 )
 
 $WarnPatterns = @(
@@ -37,13 +40,27 @@ $WarnPatterns = @(
 )
 
 function Restart-Task {
-    param([string]$TaskName)
+    param(
+        [string]$TaskName,
+        [string]$ProcessFilter
+    )
 
     $endOut = & schtasks /End /TN $TaskName 2>&1 | Out-String
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 2
+
+    $killed = 0
+    if ($ProcessFilter) {
+        $stale = Get-Process pythonw, python -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like $ProcessFilter }
+        foreach ($p in $stale) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $killed++ } catch {}
+        }
+        if ($killed -gt 0) { Start-Sleep -Seconds 1 }
+    }
+
     $runOut = & schtasks /Run /TN $TaskName 2>&1 | Out-String
 
-    Add-Content -Path $LogPath -Value "[$timestamp] restart $TaskName" -Encoding UTF8
+    Add-Content -Path $LogPath -Value "[$timestamp] restart $TaskName (killed=$killed)" -Encoding UTF8
     if ($endOut.Trim()) { Add-Content -Path $LogPath -Value ("  end : " + $endOut.Trim()) -Encoding UTF8 }
     if ($runOut.Trim()) { Add-Content -Path $LogPath -Value ("  run : " + $runOut.Trim()) -Encoding UTF8 }
 }
@@ -78,7 +95,7 @@ try {
             $sample = ($matched | Select-Object -First 5) -join ', '
             if ($matched.Count -gt 5) { $sample += ", ... ($($matched.Count) files)" }
             Add-Content -Path $LogPath -Value "[$timestamp] $($entry.Task) trigger: $sample" -Encoding UTF8
-            Restart-Task -TaskName $entry.Task
+            Restart-Task -TaskName $entry.Task -ProcessFilter $entry.ProcessFilter
             $restartedTasks[$entry.Task] = $true
         }
     }
