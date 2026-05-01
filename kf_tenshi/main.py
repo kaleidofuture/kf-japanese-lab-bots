@@ -1,7 +1,8 @@
-"""KF Tenshi - Kotoba quiz pass detector & N* V role granter for KF Japanese Lab.
+"""KF Tenshi — Kotoba quiz pass detector & N* V role granter for KF Japanese Lab.
 
 Listens for Kotoba bot quiz-end embeds, parses final scores, and grants the
-matching `N* V` Verified role to members who clear pass threshold (20/25, jlptVariables.js).
+matching `N* V` Verified role to members who clear the pass threshold
+(default: 20 / 25 from jlptVariables.js).
 
 Designed to be extended later with KF RoleLogger features (role transition log,
 time-based Newcomer→Member promotion) in the same process.
