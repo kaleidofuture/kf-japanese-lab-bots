@@ -6,6 +6,13 @@
 *.log
 logs/
 
+# SQLite DBs (KF RoleLogger event store)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+kf_role_logger/data/
+
 # Python
 __pycache__/
 *.py[cod]

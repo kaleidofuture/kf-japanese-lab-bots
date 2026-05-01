@@ -29,9 +29,8 @@ $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 # `schtasks /End` does not stop (it terminates the task but leaves any
 # spawned process running).
 $BotTaskMap = @(
-    @{ Pattern = '^kf_tenshi/.*\.(py|bat|env\.example)$'; Task = 'KFTenshi'; ProcessFilter = '*kf-japanese-lab-bots*kf_tenshi*' }
-    # Add future bots here, e.g.:
-    # @{ Pattern = '^kf_role_logger/.*\.(py|bat)$'; Task = 'KFRoleLogger'; ProcessFilter = '*kf-japanese-lab-bots*kf_role_logger*' }
+    @{ Pattern = '^kf_tenshi/.*\.(py|bat|env\.example)$';      Task = 'KFTenshi';      ProcessFilter = '*kf-japanese-lab-bots*kf_tenshi*' }
+    @{ Pattern = '^kf_role_logger/.*\.(py|bat|env\.example)$'; Task = 'KFRoleLogger'; ProcessFilter = '*kf-japanese-lab-bots*kf_role_logger*' }
 )
 
 $WarnPatterns = @(

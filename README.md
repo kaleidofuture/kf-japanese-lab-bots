@@ -9,16 +9,16 @@ KF Lab に所属するメンバー向けに自社運用している Discord bot 
 | Bot | Status | Role |
 |---|---|---|
 | **kf_tenshi** | ✅ live since 2026-05-01 | Watches Kotoba bot JLPT quiz results and grants matching `N* V` Verified roles to members who clear the pass threshold (default: 20 / 25 correct). |
-| **kf_role_logger** | 🛠 planned | Records role transitions to SQLite for Phase 4 analytics; auto-promotes Newcomer → Member after 7 days. |
+| **kf_role_logger** | ✅ live since 2026-05-01 | Records every role transition to SQLite for Phase 4 motivation-evolution analytics; auto-promotes Newcomer → Member after `PROMOTION_GRACE_DAYS` (default 7). |
 
-Both bots are designed to share a single process and venv on the host machine.
+Each bot runs as an independent process / scheduled task with its own venv and Discord application token, so a push to one bot's folder does not restart the other. They share one repository and one auto-deploy pipeline.
 
 ## Stack
 
 - Python 3.12+
 - discord.py 2.x
 - python-dotenv
-- SQLite (kf_role_logger only, planned)
+- SQLite (kf_role_logger event store, ~5 KB/month at α-phase scale)
 
 ## Quick start (kf_tenshi)
 
@@ -32,6 +32,29 @@ copy .env.example .env
 ```
 
 For persistent operation on Windows, register `run.bat` with Task Scheduler (`schtasks /Create /TN KFTenshi /TR <path>\run.bat /SC ONLOGON /RL HIGHEST`).
+
+## Quick start (kf_role_logger)
+
+```bash
+cd kf_role_logger
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+copy .env.example .env
+# edit .env with the KF RoleLogger application token and the role IDs below
+.venv\Scripts\python main.py
+```
+
+Required intents on the Discord application: **Server Members Intent** ✅, Message Content Intent ❌, Presence Intent ❌. The bot's role must be placed above `Newcomer` and `Member` in the guild role hierarchy.
+
+For testing time-based promotion without waiting 7 days, override the grace period via shell env (the value in `.env` is left at the production default of `7`):
+
+```powershell
+$env:PROMOTION_GRACE_DAYS="0.001"; .venv\Scripts\python main.py
+```
+
+The SQLite event store is created automatically at `kf_role_logger/data/role_events.db`. Every role grant/revoke is recorded with a `source` tag (`backfill`, `on_member_update`, `on_member_remove`, `auto_promote`) so analytics can isolate the synthetic pre-bot region from real events.
+
+For persistent operation: `schtasks /Create /TN KFRoleLogger /TR <path>\run.bat /SC ONLOGON /RL HIGHEST`.
 
 ## Auto-deploy (host machine, optional)
 
