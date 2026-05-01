@@ -32,7 +32,10 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew
 
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+# RunLevel Highest matches the KF Tenshi task, so the auto-pull worker can read
+# ExecutablePath of bot processes via Win32_Process and force-kill stale ones.
+# Limited integrity hides Highest processes' details across the UAC boundary.
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
 
 $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
     -Description "Auto-deploy: pull origin/main every 1 minute and restart KF Lab bots when their source changes."
