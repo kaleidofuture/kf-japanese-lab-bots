@@ -2,7 +2,7 @@
 
 Listens for Kotoba bot quiz-end embeds, parses final scores, and grants the
 matching `N* V` Verified role to members who clear the pass threshold
-(default: 20 / 25 — see Tenshi-Bot's jlptVariables.js).
+(default: 20 / 25 — see Tenshi-Bot's `jlptVariables.js`).
 
 Designed to be extended later with KF RoleLogger features (role transition log,
 time-based Newcomer→Member promotion) in the same process.
