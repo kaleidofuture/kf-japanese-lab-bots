@@ -38,6 +38,42 @@ $WarnPatterns = @(
     @{ Pattern = '^services/.*';          Note = 'manual: re-run install_auto_deploy.ps1 if the schedule itself changed' }
 )
 
+# Extra repos: pull-only, no daemon to restart. For one-shot Task Scheduler
+# pipelines (like kf-x-daily-pipeline that fires once daily at 06:00 JST), the
+# next scheduled run picks up the new code naturally — no restart needed.
+$ExtraRepos = @(
+    @{ Path = 'C:\Users\mast7\Desktop\discord-bots\kf-x-daily-pipeline'; Name = 'kf-x-daily-pipeline' }
+)
+
+function Update-ExtraRepo {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    if (-not (Test-Path (Join-Path $Path '.git'))) {
+        Add-Content -Path $LogPath -Value "[$timestamp] SKIP extra repo $Name (.git missing at $Path)" -Encoding UTF8
+        return
+    }
+
+    $output = & git -C $Path pull --ff-only 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        Add-Content -Path $LogPath -Value "[$timestamp] FAIL extra $Name exit=$exitCode" -Encoding UTF8
+        Add-Content -Path $LogPath -Value $output -Encoding UTF8
+        return
+    }
+
+    if ($output -match "Already up to date") {
+        return  # silent, same logging policy as main repo
+    }
+
+    Add-Content -Path $LogPath -Value "[$timestamp] PULL OK extra $Name" -Encoding UTF8
+    Add-Content -Path $LogPath -Value $output.TrimEnd() -Encoding UTF8
+    Add-Content -Path $LogPath -Value "" -Encoding UTF8
+}
+
 function Restart-Task {
     param(
         [string]$TaskName,
@@ -68,6 +104,11 @@ function Restart-Task {
 }
 
 try {
+    # Extra repos first: pull-only, independent of main repo state
+    foreach ($extra in $ExtraRepos) {
+        Update-ExtraRepo -Path $extra.Path -Name $extra.Name
+    }
+
     $headBefore = (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim()
 
     $output = & git -C $RepoRoot pull --ff-only 2>&1 | Out-String
