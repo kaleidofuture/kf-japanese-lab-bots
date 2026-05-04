@@ -49,7 +49,18 @@ python observe_lab.py reactions --channel daily-japanese --days 7
 
 # Threads in #pain-points-board with 🙋 counts
 python observe_lab.py pain-points
+
+# Screen a single user (snowflake age, roles, activity, heuristic flags)
+python observe_lab.py inspect-user --user-id 1500924616061878406
 ```
+
+`inspect-user` flags emitted:
+
+- `account_age_at_join_lt_24h` / `_lt_6h` — Discord account was newly minted near join time (throwaway / scraper signal)
+- `no_self_selected_roles` — never picked Level/Goal/Native (passive lurker)
+- `no_messages_after_48h` — joined > 48h ago, never posted
+
+If `in_guild: false` is returned, the user has been kicked / left / never joined; the snowflake decode still works regardless.
 
 Default output is JSON (machine-readable, KPI-pipeline-friendly). Pass
 `--markdown` for human-readable table output where supported.
@@ -57,6 +68,7 @@ Default output is JSON (machine-readable, KPI-pipeline-friendly). Pass
 ## Snapshot files
 
 `snapshot` always writes the result to two locations under `data/snapshots/`:
+
 - `YYYY-MM-DD_HHMM.json` — timestamped, append-only history
 - `latest.json` — overwritten each run, easy pickup target for KPI scripts
 

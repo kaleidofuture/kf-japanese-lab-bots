@@ -58,6 +58,14 @@ SNAPSHOT_DIR = DATA_DIR / "snapshots"
 
 JST = timezone(timedelta(hours=9))
 
+DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01 UTC, used for snowflake → datetime decode
+
+
+def snowflake_to_datetime(snowflake_id: int) -> datetime:
+    """Decode a Discord snowflake ID into the UTC datetime it was minted."""
+    timestamp_ms = (snowflake_id >> 22) + DISCORD_EPOCH_MS
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+
 
 def _require_env() -> tuple[str, int]:
     if not DISCORD_TOKEN:
@@ -330,6 +338,86 @@ def cmd_reactions(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# inspect-user — screening for new joiners (account age, roles, activity)
+# ---------------------------------------------------------------------------
+
+async def _action_inspect_user(
+    client: discord.Client, guild: discord.Guild, user_id: int,
+) -> dict[str, Any]:
+    member: discord.Member | None = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.NotFound:
+            account_created = snowflake_to_datetime(user_id)
+            return {
+                "user_id": user_id,
+                "in_guild": False,
+                "account_created_utc": account_created.isoformat(),
+                "note": "user not currently a member of this guild (kicked / left / never joined)",
+            }
+        except discord.HTTPException as e:
+            return {"user_id": user_id, "error": f"fetch_member failed: {e}"}
+
+    account_created = snowflake_to_datetime(user_id)
+    joined_at = member.joined_at
+    age_at_join = (joined_at - account_created) if joined_at else None
+
+    # Activity scan: count messages from this user in last 7 days, server-wide
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    msg_count = 0
+    last_msg_at: datetime | None = None
+    last_msg_channel: str | None = None
+    for ch in guild.text_channels:
+        try:
+            async for m in ch.history(limit=200, after=cutoff):
+                if m.author.id == user_id:
+                    msg_count += 1
+                    if last_msg_at is None or m.created_at > last_msg_at:
+                        last_msg_at = m.created_at
+                        last_msg_channel = ch.name
+        except discord.Forbidden:
+            continue
+
+    # Heuristic flags — explicit, not opinions
+    flags: list[str] = []
+    if age_at_join is not None and age_at_join < timedelta(days=1):
+        flags.append("account_age_at_join_lt_24h")
+    if age_at_join is not None and age_at_join < timedelta(hours=6):
+        flags.append("account_age_at_join_lt_6h")
+    selectable_roles = [r.name for r in member.roles if not r.is_default() and r.name != "Newcomer"]
+    if not selectable_roles:
+        flags.append("no_self_selected_roles")
+    if msg_count == 0 and joined_at and (datetime.now(timezone.utc) - joined_at) > timedelta(hours=48):
+        flags.append("no_messages_after_48h")
+
+    return {
+        "user_id": user_id,
+        "in_guild": True,
+        "name": member.name,
+        "display_name": member.display_name,
+        "is_bot": member.bot,
+        "account_created_utc": account_created.isoformat(),
+        "joined_kf_lab_at_utc": joined_at.isoformat() if joined_at else None,
+        "account_age_at_join": str(age_at_join) if age_at_join else None,
+        "roles": [r.name for r in member.roles if not r.is_default()],
+        "avatar_url": str(member.display_avatar.url) if member.display_avatar else None,
+        "messages_last_7d": msg_count,
+        "last_message_at_utc": last_msg_at.isoformat() if last_msg_at else None,
+        "last_message_channel": last_msg_channel,
+        "flags": flags,
+    }
+
+
+def cmd_inspect_user(args: argparse.Namespace) -> int:
+    payload = asyncio.run(
+        with_client(lambda c, g: _action_inspect_user(c, g, args.user_id))
+    )
+    _emit(payload, None, args)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # pain-points (threads in #pain-points-board with 🙋 counts)
 # ---------------------------------------------------------------------------
 
@@ -438,6 +526,13 @@ def build_parser() -> argparse.ArgumentParser:
         "pain-points", parents=[common], help="Threads in #pain-points-board with 🙋 counts"
     )
 
+    sp = sub.add_parser(
+        "inspect-user",
+        parents=[common],
+        help="Screen a single user (snowflake age, roles, recent activity, heuristic flags)",
+    )
+    sp.add_argument("--user-id", type=int, required=True)
+
     return parser
 
 
@@ -448,6 +543,7 @@ COMMANDS = {
     "recent-activity": cmd_recent_activity,
     "reactions": cmd_reactions,
     "pain-points": cmd_pain_points,
+    "inspect-user": cmd_inspect_user,
 }
 
 
