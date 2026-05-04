@@ -405,25 +405,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="KF Observer — read-only Discord state inspector for KF Japanese Lab",
     )
-    parser.add_argument(
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "--markdown",
         action="store_true",
         help="Render output as markdown where supported (default: JSON)",
     )
+
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("snapshot", help="Full state snapshot → stdout + data/snapshots/<ts>.json")
-    sub.add_parser("members", help="Human members with their roles")
-    sub.add_parser("role-distribution", help="Member count per role")
+    sub.add_parser(
+        "snapshot",
+        parents=[common],
+        help="Full state snapshot → stdout + data/snapshots/<ts>.json",
+    )
+    sub.add_parser("members", parents=[common], help="Human members with their roles")
+    sub.add_parser("role-distribution", parents=[common], help="Member count per role")
 
-    sp = sub.add_parser("recent-activity", help="Per-channel activity in the last N hours")
+    sp = sub.add_parser(
+        "recent-activity", parents=[common], help="Per-channel activity in the last N hours"
+    )
     sp.add_argument("--hours", type=int, default=24)
 
-    sp = sub.add_parser("reactions", help="Reaction tallies in a channel over the last N days")
+    sp = sub.add_parser(
+        "reactions", parents=[common], help="Reaction tallies in a channel over the last N days"
+    )
     sp.add_argument("--channel", required=True)
     sp.add_argument("--days", type=int, default=7)
 
-    sub.add_parser("pain-points", help="Threads in #pain-points-board with 🙋 counts")
+    sub.add_parser(
+        "pain-points", parents=[common], help="Threads in #pain-points-board with 🙋 counts"
+    )
 
     return parser
 
