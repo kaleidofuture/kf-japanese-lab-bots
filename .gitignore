@@ -13,6 +13,9 @@ logs/
 *.db-shm
 kf_role_logger/data/
 
+# KF Observer snapshot output (per-machine state, never tracked)
+kf_observer/data/
+
 # Python
 __pycache__/
 *.py[cod]
