@@ -44,7 +44,7 @@ copy .env.example .env
 .venv\Scripts\python main.py
 ```
 
-Required intents on the Discord application: **Server Members Intent** ✅, Message Content Intent ❌, Presence Intent ❌. The bot's role must be placed above `Newcomer` and `Member` in the guild role hierarchy.
+Required intents on the Discord application: **Server Members Intent** ✅, Message Content Intent ❌, Presence Intent ❌. The bot's role must be placed above `Newcomer` and `Member` in the guild role hierarchy, **and the role itself must have the `Manage Roles` permission** — without it, `add_roles` / `remove_roles` raises `Forbidden` even when the hierarchy is correct.
 
 For testing time-based promotion without waiting 7 days, override the grace period via shell env (the value in `.env` is left at the production default of `7`):
 
@@ -76,7 +76,7 @@ After install, every `git push` to `origin/main` reaches the host within a minut
 ## Architecture notes
 
 - **Wrapper log vs app log are separated** — `run.bat` redirects stdout/stderr to `wrapper.log`; the app itself writes structured logs to `kf_tenshi.log` via Python `logging.FileHandler`. They cannot share the same file due to Windows file locking.
-- **Bot role hierarchy matters** — the bot's role must be placed *above* the roles it grants in the Discord guild settings, otherwise role assignment fails with `Forbidden`.
+- **Bot role hierarchy *and* `Manage Roles` permission both matter** — the bot's role must be placed *above* the roles it grants in the Discord guild settings, *and* the role itself must have the `Manage Roles` permission enabled. Either missing surfaces as `Forbidden: cannot promote <user> — check role hierarchy.` even though the hierarchy may already be correct.
 - **Privileged Gateway Intents required** — `Server Members Intent` and `Message Content Intent` must be enabled in the Discord Developer Portal for each bot application.
 
 ## Why not [Tenshi-Bot OSS](https://github.com/Miraii133/Tenshi-Bot)?
