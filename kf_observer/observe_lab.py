@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -59,6 +60,31 @@ SNAPSHOT_DIR = DATA_DIR / "snapshots"
 JST = timezone(timedelta(hours=9))
 
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01 UTC, used for snowflake → datetime decode
+
+# β期トリガー判定で「除外」する Marine 系 user_id（18_beta_trigger_definition.md と整合）
+MARINE_USER_ID = 1498849053121843352
+MARINE7310_USER_ID = 1190550699151478784
+EXCLUDED_USER_IDS: set[int] = {MARINE_USER_ID, MARINE7310_USER_ID}
+
+# scam 検知用パターン（project_jp_lab_discord_alpha.md / project_jp_lab_kpi_measurement.md と整合）
+PROTECTED_ROLE_NAMES = {"Founder", "Admin", "Moderator", "Mod", "Owner", "Staff"}
+
+DM_REDIRECTION_PATTERNS = [
+    re.compile(r"\bch[.\W_]*ck[.\W_]+(?:your[.\W_]+)?(?:dm|pm|inbox|messages?)", re.IGNORECASE),
+    re.compile(r"\bdm\s+me\b", re.IGNORECASE),
+    re.compile(r"\bpm\s+you\b", re.IGNORECASE),
+    re.compile(r"\bmessag(?:ed|ing)?\s+you\b", re.IGNORECASE),
+    re.compile(r"\binbox\b.*\bme\b", re.IGNORECASE),
+]
+
+TITLE_IMPERSONATION_PATTERN = re.compile(
+    r"\b(?:prof|professor|admin|administrator|mod|moderator|staff|owner|founder|sensei|teacher|tutor)[\W_]*",
+    re.IGNORECASE,
+)
+
+FIRST_POST_FAST_THRESHOLD_MINUTES = 5
+REACTION_ONLY_SCAN_HOURS = 24
+REACTION_ONLY_MIN_COUNT = 3
 
 
 def snowflake_to_datetime(snowflake_id: int) -> datetime:
@@ -341,6 +367,87 @@ def cmd_reactions(args: argparse.Namespace) -> int:
 # inspect-user — screening for new joiners (account age, roles, activity)
 # ---------------------------------------------------------------------------
 
+async def _scan_user_messages(
+    guild: discord.Guild, user_id: int, since: datetime, history_limit: int = 200,
+) -> tuple[int, discord.Message | None, discord.Message | None]:
+    """全 text channel をスキャンし、user_id の投稿数・最初の投稿・最新の投稿を返す。
+
+    Returns:
+        (msg_count, first_message, last_message)
+    """
+    msg_count = 0
+    first_msg: discord.Message | None = None
+    last_msg: discord.Message | None = None
+    for ch in guild.text_channels:
+        try:
+            async for m in ch.history(limit=history_limit, after=since):
+                if m.author.id == user_id:
+                    msg_count += 1
+                    if first_msg is None or m.created_at < first_msg.created_at:
+                        first_msg = m
+                    if last_msg is None or m.created_at > last_msg.created_at:
+                        last_msg = m
+        except discord.Forbidden:
+            continue
+    return msg_count, first_msg, last_msg
+
+
+def _detect_dm_redirection(content: str) -> bool:
+    if not content:
+        return False
+    for pat in DM_REDIRECTION_PATTERNS:
+        if pat.search(content):
+            return True
+    return False
+
+
+def _detect_title_impersonation(display_name: str) -> bool:
+    if not display_name:
+        return False
+    return bool(TITLE_IMPERSONATION_PATTERN.search(display_name))
+
+
+def _detect_protected_role_mention(message: discord.Message) -> bool:
+    if not message:
+        return False
+    mentioned_role_names = {r.name for r in (message.role_mentions or [])}
+    if mentioned_role_names & PROTECTED_ROLE_NAMES:
+        return True
+    # 表記が "@Founder" などをテキストで書いている場合（実 mention でなく文字列）も拾う
+    content = message.content or ""
+    for protected in PROTECTED_ROLE_NAMES:
+        if re.search(rf"@\s*{re.escape(protected)}\b", content, re.IGNORECASE):
+            return True
+    return False
+
+
+async def _count_reactions_given_by_user(
+    guild: discord.Guild, user_id: int, since: datetime, history_limit: int = 100,
+) -> int:
+    """user_id がリアクションを付けた message 数を概算でカウント。
+
+    Discord API レート制限を踏まえ、history_limit を絞り、リアクションが付いている message にのみ
+    users() を呼ぶ。Newcomer 投稿0 + 参加24h以内のような限定的な scenario を想定。
+    """
+    count = 0
+    for ch in guild.text_channels:
+        try:
+            async for m in ch.history(limit=history_limit, after=since):
+                if not m.reactions:
+                    continue
+                for r in m.reactions:
+                    try:
+                        async for u in r.users():
+                            if u.id == user_id:
+                                count += 1
+                                break
+                    except discord.HTTPException:
+                        continue
+        except discord.Forbidden:
+            continue
+    return count
+
+
 async def _action_inspect_user(
     client: discord.Client, guild: discord.Guild, user_id: int,
 ) -> dict[str, Any]:
@@ -365,19 +472,18 @@ async def _action_inspect_user(
 
     # Activity scan: count messages from this user in last 7 days, server-wide
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-    msg_count = 0
-    last_msg_at: datetime | None = None
-    last_msg_channel: str | None = None
-    for ch in guild.text_channels:
-        try:
-            async for m in ch.history(limit=200, after=cutoff):
-                if m.author.id == user_id:
-                    msg_count += 1
-                    if last_msg_at is None or m.created_at > last_msg_at:
-                        last_msg_at = m.created_at
-                        last_msg_channel = ch.name
-        except discord.Forbidden:
-            continue
+    msg_count, first_msg, last_msg = await _scan_user_messages(guild, user_id, cutoff)
+
+    last_msg_at = last_msg.created_at if last_msg else None
+    last_msg_channel = last_msg.channel.name if last_msg else None
+
+    # First-post derived fields (2026-05-18 追加, Prof 事案ベース)
+    first_post_at: datetime | None = first_msg.created_at if first_msg else None
+    first_post_channel: str | None = first_msg.channel.name if first_msg else None
+    first_post_excerpt: str | None = (first_msg.content or "")[:100] if first_msg else None
+    first_post_lag_min: float | None = None
+    if first_msg and joined_at:
+        first_post_lag_min = (first_msg.created_at - joined_at).total_seconds() / 60.0
 
     # Heuristic flags — explicit, not opinions
     flags: list[str] = []
@@ -390,6 +496,37 @@ async def _action_inspect_user(
         flags.append("no_self_selected_roles")
     if msg_count == 0 and joined_at and (datetime.now(timezone.utc) - joined_at) > timedelta(hours=48):
         flags.append("no_messages_after_48h")
+
+    # 2026-05-18 追加: aged-account × DM phishing 検知用フラグ (Prof_🧑‍🏫 事案ベース)
+    if first_msg is not None:
+        if _detect_protected_role_mention(first_msg):
+            flags.append("founder_mention_within_first_post")
+        if _detect_dm_redirection(first_msg.content or ""):
+            flags.append("dm_redirection_phrase_detected")
+    if _detect_title_impersonation(member.display_name):
+        flags.append("title_impersonation_in_display_name")
+    if (
+        first_post_lag_min is not None
+        and 0 <= first_post_lag_min < FIRST_POST_FAST_THRESHOLD_MINUTES
+    ):
+        flags.append(f"first_post_within_{FIRST_POST_FAST_THRESHOLD_MINUTES}min_of_join")
+
+    # reaction_only_engagement: Newcomer × 投稿0 × 参加24h以内 でのみ実行（重い処理を限定）
+    is_newcomer = any(r.name == "Newcomer" for r in member.roles)
+    reaction_count_within_24h: int | None = None
+    if (
+        is_newcomer
+        and msg_count == 0
+        and joined_at is not None
+        and (datetime.now(timezone.utc) - joined_at) <= timedelta(hours=REACTION_ONLY_SCAN_HOURS)
+    ):
+        reaction_count_within_24h = await _count_reactions_given_by_user(
+            guild, user_id, joined_at,
+        )
+        if reaction_count_within_24h >= REACTION_ONLY_MIN_COUNT:
+            flags.append(
+                f"reaction_only_engagement_within_first_{REACTION_ONLY_SCAN_HOURS}h"
+            )
 
     return {
         "user_id": user_id,
@@ -405,6 +542,11 @@ async def _action_inspect_user(
         "messages_last_7d": msg_count,
         "last_message_at_utc": last_msg_at.isoformat() if last_msg_at else None,
         "last_message_channel": last_msg_channel,
+        "first_post_at_utc": first_post_at.isoformat() if first_post_at else None,
+        "first_post_channel": first_post_channel,
+        "first_post_excerpt": first_post_excerpt,
+        "first_post_lag_min": first_post_lag_min,
+        "reaction_count_within_24h": reaction_count_within_24h,
         "flags": flags,
     }
 
@@ -413,6 +555,169 @@ def cmd_inspect_user(args: argparse.Namespace) -> int:
     payload = asyncio.run(
         with_client(lambda c, g: _action_inspect_user(c, g, args.user_id))
     )
+    _emit(payload, None, args)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# assess-effective-members — β期トリガー判定用、有効 Member 概念で全 Member を集計
+# (2026-05-18 追加, 18_beta_trigger_definition.md 改訂版と整合)
+# ---------------------------------------------------------------------------
+
+EFFECTIVE_MEMBERS_DIR = DATA_DIR / "effective_members"
+NEWCOMER_LURKER_DAYS = 14  # Newcomer のまま 14日経過は母数除外
+INACTIVE_DAYS_THRESHOLD = 90  # 90日連続無活動は母数除外
+
+
+async def _evaluate_member_effectiveness(
+    guild: discord.Guild, member: discord.Member, since: datetime,
+) -> dict[str, Any]:
+    """1人のメンバーの「有効 Member 条件」を評価して構造化 dict を返す。
+
+    有効 Member = Member ロール保持 AND
+      (ロール自己選択 ≥1個 OR パブリック投稿 ≥1件 OR リアクション付与 ≥1個)
+      AND scam フラグなし
+    """
+    selectable_roles = [
+        r.name for r in member.roles
+        if not r.is_default() and r.name not in ("Newcomer", "Member")
+    ]
+    has_role = len(selectable_roles) >= 1
+
+    msg_count, first_msg, _last_msg = await _scan_user_messages(
+        guild, member.id, since, history_limit=500,
+    )
+    has_post = msg_count >= 1
+
+    # リアクション付与カウントは、ロール選択も投稿も無い場合のみ実行（API 節約）
+    reaction_count: int | None = None
+    has_reaction = False
+    if not (has_role or has_post):
+        reaction_count = await _count_reactions_given_by_user(
+            guild, member.id, since, history_limit=100,
+        )
+        has_reaction = reaction_count >= 1
+
+    # scam フラグ（軽量判定）
+    scam_flags: list[str] = []
+    if _detect_title_impersonation(member.display_name):
+        scam_flags.append("title_impersonation_in_display_name")
+    if first_msg is not None:
+        if _detect_protected_role_mention(first_msg):
+            scam_flags.append("founder_mention_within_first_post")
+        if _detect_dm_redirection(first_msg.content or ""):
+            scam_flags.append("dm_redirection_phrase_detected")
+        if member.joined_at is not None:
+            lag_min = (first_msg.created_at - member.joined_at).total_seconds() / 60.0
+            if 0 <= lag_min < FIRST_POST_FAST_THRESHOLD_MINUTES:
+                scam_flags.append(
+                    f"first_post_within_{FIRST_POST_FAST_THRESHOLD_MINUTES}min_of_join"
+                )
+
+    is_effective = (has_role or has_post or has_reaction) and not scam_flags
+
+    return {
+        "user_id": member.id,
+        "name": member.name,
+        "display_name": member.display_name,
+        "joined_at_utc": member.joined_at.isoformat() if member.joined_at else None,
+        "self_selected_role_count": len(selectable_roles),
+        "self_selected_roles": selectable_roles,
+        "public_post_count_30d": msg_count,
+        "reaction_count_30d": reaction_count,
+        "scam_flags": scam_flags,
+        "is_effective_member": is_effective,
+    }
+
+
+async def _action_assess_effective_members(
+    client: discord.Client, guild: discord.Guild, window_days: int,
+) -> dict[str, Any]:
+    member_role = discord.utils.get(guild.roles, name="Member")
+    if member_role is None:
+        return {"error": "Member role not found in guild"}
+
+    holders = [
+        m for m in guild.members
+        if member_role in m.roles
+        and not m.bot
+        and m.id not in EXCLUDED_USER_IDS
+    ]
+
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    results = []
+    for member in holders:
+        evaluation = await _evaluate_member_effectiveness(guild, member, since)
+        results.append(evaluation)
+
+    # Newcomer のまま long-stay している外部メンバーも集計（lurker 除外条件の判定材料）
+    newcomer_role = discord.utils.get(guild.roles, name="Newcomer")
+    newcomer_only = []
+    if newcomer_role is not None:
+        for m in guild.members:
+            if (
+                newcomer_role in m.roles
+                and member_role not in m.roles
+                and not m.bot
+                and m.id not in EXCLUDED_USER_IDS
+            ):
+                joined = m.joined_at
+                days_in_lab = None
+                if joined is not None:
+                    days_in_lab = (datetime.now(timezone.utc) - joined).days
+                lurker_excluded = (
+                    days_in_lab is not None and days_in_lab >= NEWCOMER_LURKER_DAYS
+                )
+                newcomer_only.append({
+                    "user_id": m.id,
+                    "name": m.name,
+                    "display_name": m.display_name,
+                    "joined_at_utc": joined.isoformat() if joined else None,
+                    "days_in_lab": days_in_lab,
+                    "newcomer_lurker_excluded": lurker_excluded,
+                })
+
+    effective_count = sum(1 for r in results if r["is_effective_member"])
+    scam_flagged_count = sum(1 for r in results if r["scam_flags"])
+    beta_member_threshold = 10
+    beta_member_pass = effective_count >= beta_member_threshold
+
+    return {
+        "captured_at_jst": datetime.now(JST).isoformat(),
+        "guild_id": guild.id,
+        "window_days": window_days,
+        "excluded_user_ids": list(EXCLUDED_USER_IDS),
+        "member_role_holders_count": len(holders),
+        "effective_member_external_count": effective_count,
+        "scam_flagged_external_count": scam_flagged_count,
+        "beta_member_threshold": beta_member_threshold,
+        "beta_member_pass": beta_member_pass,
+        "member_evaluations": results,
+        "newcomer_only_external": newcomer_only,
+    }
+
+
+def cmd_assess_effective_members(args: argparse.Namespace) -> int:
+    payload = asyncio.run(
+        with_client(
+            lambda c, g: _action_assess_effective_members(c, g, args.window_days)
+        )
+    )
+
+    EFFECTIVE_MEMBERS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(JST).strftime("%Y-%m-%d_%H%M")
+    snapshot_path = EFFECTIVE_MEMBERS_DIR / f"{timestamp}.json"
+    latest_path = EFFECTIVE_MEMBERS_DIR / "latest.json"
+    snapshot_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    latest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    print(f"# Effective-members assessment saved: {snapshot_path}", file=sys.stderr)
+
     _emit(payload, None, args)
     return 0
 
@@ -533,6 +838,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--user-id", type=int, required=True)
 
+    sp = sub.add_parser(
+        "assess-effective-members",
+        parents=[common],
+        help=(
+            "Evaluate '有効 Member' for all Member-role holders (excludes Marine system "
+            "accounts). Writes data/effective_members/latest.json for kfjl_ingestor to consume."
+        ),
+    )
+    sp.add_argument(
+        "--window-days", type=int, default=30,
+        help="Activity scan window in days (default: 30, per 18_beta_trigger_definition.md)",
+    )
+
     return parser
 
 
@@ -544,6 +862,7 @@ COMMANDS = {
     "reactions": cmd_reactions,
     "pain-points": cmd_pain_points,
     "inspect-user": cmd_inspect_user,
+    "assess-effective-members": cmd_assess_effective_members,
 }
 
 
