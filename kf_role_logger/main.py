@@ -28,6 +28,18 @@ GUILD_ID = int(os.environ["GUILD_ID"])
 ROLE_NEWCOMER = int(os.environ["ROLE_NEWCOMER"])
 ROLE_MEMBER = int(os.environ["ROLE_MEMBER"])
 PROMOTION_GRACE_DAYS = float(os.environ.get("PROMOTION_GRACE_DAYS", "7"))
+RESTORE_WINDOW_DAYS = float(os.environ.get("RESTORE_WINDOW_DAYS", "90"))
+
+# Self-selected roles (Carl-bot reaction-role panels). Excludes system-managed
+# roles (Newcomer / Member / N#V verified levels) and bot/admin roles.
+SELF_SELECT_ROLE_NAMES: frozenset[str] = frozenset({
+    # Level (self-declared, unverified)
+    "N1", "N2", "N3", "N4", "N5",
+    # Goal
+    "Business", "JLPT", "Living", "Casual", "PopCulture", "Other",
+    # Native
+    "Native Japanese Speaker", "Native English Speaker", "Native Other",
+})
 
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -125,6 +137,90 @@ def _backfill_existing_members(guild: discord.Guild) -> None:
     )
 
 
+async def _restore_self_selected_roles(member: discord.Member, *, source: str) -> int:
+    """Re-add the self-select roles a member held at the end of their last closed
+    session, if that close was within RESTORE_WINDOW_DAYS. Returns # roles added.
+
+    No-op if: bot account, no prior closed session, outside window, no eligible
+    roles, or all eligible roles already present on the live member.
+    """
+    if member.bot:
+        return 0
+    prior = db.get_prior_self_selected_roles(
+        conn, member.id, RESTORE_WINDOW_DAYS, SELF_SELECT_ROLE_NAMES,
+    )
+    if not prior:
+        return 0
+
+    current_role_ids = {r.id for r in member.roles}
+    role_objs: list[discord.Role] = []
+    for rid in prior:
+        if rid in current_role_ids:
+            continue
+        role = member.guild.get_role(rid)
+        if role is None:
+            log.warning(
+                "Restore: role_id=%s not on guild (renamed/deleted?) — skipped",
+                rid,
+            )
+            continue
+        if role.is_default():
+            continue
+        role_objs.append(role)
+
+    if not role_objs:
+        return 0
+
+    try:
+        await member.add_roles(*role_objs, reason=f"Restore self-selected roles ({source})")
+    except discord.Forbidden:
+        log.error("Forbidden: cannot restore roles for %s — check role hierarchy.", member)
+        return 0
+    except discord.HTTPException as e:
+        log.error("HTTPException restoring %s: %s", member, e)
+        return 0
+
+    ts = db.now_utc()
+    for role in role_objs:
+        db.insert_role_event(
+            conn, member.id, "added", role.id, role.name,
+            timestamp=ts, source=source,
+        )
+    log.info(
+        "Restored %d self-select role(s) for %s: %s",
+        len(role_objs), member, [r.name for r in role_objs],
+    )
+    return len(role_objs)
+
+
+@tasks.loop(hours=24)
+async def role_restore_reconcile_loop() -> None:
+    """Daily safety net: scan all guild members for missed self-select role
+    restorations (covers cases where on_member_join didn't run — e.g. bot was
+    offline during the re-join)."""
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        log.warning("role_restore_reconcile_loop: guild=%s not available, skipping tick.", GUILD_ID)
+        return
+
+    n_members = n_total = 0
+    for member in guild.members:
+        if member.bot:
+            continue
+        if any(r.name in SELF_SELECT_ROLE_NAMES for r in member.roles):
+            continue
+        n = await _restore_self_selected_roles(member, source="reconcile_loop")
+        if n:
+            n_members += 1
+            n_total += n
+
+    if n_total:
+        log.info(
+            "role_restore_reconcile_loop: restored %d role(s) across %d member(s)",
+            n_total, n_members,
+        )
+
+
 @tasks.loop(hours=1)
 async def auto_promote_loop() -> None:
     """Promote Newcomers whose grant is older than PROMOTION_GRACE_DAYS."""
@@ -196,11 +292,12 @@ async def on_ready() -> None:
         bot.user.id if bot.user else "?",
     )
     log.info(
-        "Watching guild=%s, newcomer=%s, member=%s, grace_days=%s, db=%s",
+        "Watching guild=%s, newcomer=%s, member=%s, grace_days=%s, restore_window_days=%s, db=%s",
         GUILD_ID,
         ROLE_NEWCOMER,
         ROLE_MEMBER,
         PROMOTION_GRACE_DAYS,
+        RESTORE_WINDOW_DAYS,
         DB_PATH,
     )
 
@@ -214,6 +311,13 @@ async def on_ready() -> None:
         auto_promote_loop.start()
         log.info("auto_promote_loop started (interval=1h, grace_days=%s)", PROMOTION_GRACE_DAYS)
 
+    if not role_restore_reconcile_loop.is_running():
+        role_restore_reconcile_loop.start()
+        log.info(
+            "role_restore_reconcile_loop started (interval=24h, window_days=%s)",
+            RESTORE_WINDOW_DAYS,
+        )
+
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
@@ -225,7 +329,8 @@ async def on_member_join(member: discord.Member) -> None:
     joined_iso = db.to_iso(member.joined_at) or db.now_utc()
     now_iso = db.now_utc()
 
-    if db.member_exists(conn, member.id):
+    is_rejoin = db.member_exists(conn, member.id)
+    if is_rejoin:
         db.increment_session_count(conn, member.id)
         log.info("Re-join: %s (id=%s) — incremented total_sessions", member, member.id)
     else:
@@ -236,6 +341,11 @@ async def on_member_join(member: discord.Member) -> None:
     db.update_last_seen(conn, member.id, now_iso)
     log.info("Opened session_id=%s for %s", sid, member)
     # Role grants (e.g. Carl-bot Newcomer auto-assign) follow within seconds via on_member_update.
+
+    if is_rejoin:
+        n = await _restore_self_selected_roles(member, source="on_member_join_restore")
+        if n:
+            log.info("on_member_join: restored %d self-select role(s) for %s", n, member)
 
 
 @bot.event

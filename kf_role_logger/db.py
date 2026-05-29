@@ -242,6 +242,52 @@ def find_promotion_candidates(
     return [(int(r["user_id"]), int(r["session_id"]), str(r["granted_at"])) for r in rows]
 
 
+def get_prior_self_selected_roles(
+    conn: sqlite3.Connection,
+    user_id: int,
+    window_days: float,
+    self_select_role_names: frozenset[str],
+) -> dict[int, str] | None:
+    """Return {role_id: role_name} of self-select roles the user held at the end
+    of their most-recent closed session, filtered to the allowlist.
+
+    Returns None if no closed session exists, or if its left_at is older than
+    `window_days` ago. Events with source='on_member_remove' are excluded so
+    the leave-time wipe doesn't zero out the state we want to reconstruct.
+    """
+    row = conn.execute(
+        "SELECT left_at FROM sessions "
+        "WHERE user_id = ? AND left_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    left_at = row["left_at"]
+    left_dt = datetime.fromisoformat(left_at)
+    if left_dt.tzinfo is None:
+        left_dt = left_dt.replace(tzinfo=timezone.utc)
+    age_days = (datetime.now(timezone.utc) - left_dt).total_seconds() / 86400
+    if age_days > window_days:
+        return None
+
+    rows = conn.execute(
+        "SELECT role_id, role_name, event_type FROM role_events "
+        "WHERE user_id = ? AND timestamp <= ? AND source != 'on_member_remove' "
+        "ORDER BY timestamp, id",
+        (user_id, left_at),
+    ).fetchall()
+    held: dict[int, str] = {}
+    for e in rows:
+        rid = int(e["role_id"])
+        if e["event_type"] == "added":
+            held[rid] = e["role_name"]
+        elif e["event_type"] == "removed":
+            held.pop(rid, None)
+    return {rid: name for rid, name in held.items() if name in self_select_role_names}
+
+
 def record_promotion(
     conn: sqlite3.Connection,
     user_id: int,
