@@ -1,6 +1,6 @@
 # KF Japanese Lab Bots
 
-Self-hosted Discord bots powering the [KaleidoFuture Japanese Lab](https://discord.gg/gaujRWbmg) — a building-in-public community for Japanese learners worldwide.
+Self-hosted Discord bots powering the [KaleidoFuture Japanese Lab](https://discord.gg/c8PzQmBSMn) — a building-in-public community for Japanese learners worldwide.
 
 KF Lab に所属するメンバー向けに自社運用している Discord bot 群。Building in Public 哲学のもとオープンソース公開。
 
