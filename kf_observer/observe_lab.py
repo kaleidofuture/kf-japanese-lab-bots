@@ -10,6 +10,9 @@ Bot permissions (configured in Developer Portal + OAuth2 invite URL):
   - View Channels
   - Read Message History
   - Server Members Intent (privileged, enabled in portal)
+  - Message Content Intent (privileged, enabled in portal 2026-06-18 — without it
+    m.content returns "" so reactions/inspect-user excerpts and the content-based
+    scam flags silently no-op)
 
 The bot has zero write permissions — cannot post, kick, ban, or change roles.
 
@@ -19,6 +22,7 @@ Usage examples:
   python observe_lab.py role-distribution
   python observe_lab.py recent-activity --hours 24
   python observe_lab.py reactions --channel daily-japanese --days 7
+  python observe_lab.py messages --channel 日本語-only --hours 96
   python observe_lab.py pain-points
 
 Output is JSON to stdout by default. Pass `--markdown` for human-readable
@@ -112,6 +116,7 @@ def _build_intents() -> discord.Intents:
     intents.members = True
     intents.guilds = True
     intents.reactions = True
+    intents.message_content = True  # 2026-06-18: 本文取得（messages dump + reactions/inspect-user の excerpt + content系scam検知）
     return intents
 
 
@@ -360,6 +365,72 @@ def cmd_reactions(args: argparse.Namespace) -> int:
         with_client(lambda c, g: _action_reactions(c, g, args.channel, args.days))
     )
     _emit(payload, None, args)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# messages — full-content dump for a single channel (requires Message Content Intent)
+# ---------------------------------------------------------------------------
+
+async def _action_messages(
+    client: discord.Client, guild: discord.Guild, channel_name: str, hours: int, limit: int,
+) -> dict[str, Any]:
+    target = next((c for c in guild.text_channels if c.name == channel_name), None)
+    if target is None:
+        return {"error": f"channel not found: {channel_name}"}
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    try:
+        msgs = [m async for m in target.history(limit=limit, after=since, oldest_first=True)]
+    except discord.Forbidden:
+        return {"error": f"forbidden: bot cannot read history of #{channel_name}"}
+    rows: list[dict[str, Any]] = []
+    for m in msgs:
+        rows.append({
+            "message_id": m.id,
+            "created_at_utc": m.created_at.isoformat(),
+            "created_at_jst": m.created_at.astimezone(JST).strftime("%Y-%m-%d %H:%M"),
+            "author": m.author.name,
+            "author_display": m.author.display_name,
+            "content": m.content or "",
+            "attachments": [a.url for a in m.attachments],
+            "reactions": {str(r.emoji): r.count for r in m.reactions},
+        })
+    return {
+        "captured_at_jst": datetime.now(JST).isoformat(),
+        "channel": channel_name,
+        "since_utc": since.isoformat(),
+        "message_count": len(rows),
+        "messages": rows,
+    }
+
+
+def _md_messages(payload: dict[str, Any]) -> str:
+    if "error" in payload:
+        return f"**error:** {payload['error']}"
+    lines = [
+        f"**#{payload['channel']}** — {payload['message_count']} messages "
+        f"(since {payload['since_utc']})",
+        "",
+    ]
+    for m in payload["messages"]:
+        body = (m["content"] or "").replace("\n", "\n    ")  # 複数行はインデントで可読性維持
+        if not body:
+            body = "[no text]" if not m["attachments"] else ""
+        att = f"  [+{len(m['attachments'])} attachment(s)]" if m["attachments"] else ""
+        react = ""
+        if m["reactions"]:
+            react = "  " + " ".join(f"{k}×{v}" for k, v in m["reactions"].items())
+        lines.append(
+            f"- `{m['created_at_jst']} JST` **{m['author_display']}**: {body}{att}{react}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_messages(args: argparse.Namespace) -> int:
+    payload = asyncio.run(
+        with_client(lambda c, g: _action_messages(c, g, args.channel, args.hours, args.limit))
+    )
+    _emit(payload, _md_messages, args)
     return 0
 
 
@@ -827,6 +898,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--channel", required=True)
     sp.add_argument("--days", type=int, default=7)
 
+    sp = sub.add_parser(
+        "messages",
+        parents=[common],
+        help="Full message content dump for a channel over the last N hours (needs Message Content Intent)",
+    )
+    sp.add_argument("--channel", required=True)
+    sp.add_argument("--hours", type=int, default=24)
+    sp.add_argument("--limit", type=int, default=200)
+
     sub.add_parser(
         "pain-points", parents=[common], help="Threads in #pain-points-board with 🙋 counts"
     )
@@ -860,6 +940,7 @@ COMMANDS = {
     "role-distribution": cmd_role_distribution,
     "recent-activity": cmd_recent_activity,
     "reactions": cmd_reactions,
+    "messages": cmd_messages,
     "pain-points": cmd_pain_points,
     "inspect-user": cmd_inspect_user,
     "assess-effective-members": cmd_assess_effective_members,
